@@ -1,84 +1,78 @@
 from __future__ import annotations
 
-from exo import *
-from exo.libs.memories import AVX2
+import os
+import sys
+
+from exo import proc
+from exo.platforms.x86 import *
 from exo.stdlib.scheduling import *
 
-
-@instr("{dst_data} = _mm256_loadu_ps(&{src_data});")
-def vector_load(dst: [f32][8] @ AVX2, src: [f32][8] @ DRAM):
-    assert stride(src, 0) == 1
-    assert stride(dst, 0) == 1
-
-    for i in seq(0, 8):
-        dst[i] = src[i]
+# Hide output when running through exocc.
+if __name__ != "__main__" and hasattr(os, "devnull"):
+    sys.stdout = open(os.devnull, "w")
 
 
-@instr("_mm256_storeu_ps(&{dst_data}, {src_data});")
-def vector_store(dst: [f32][8] @ DRAM, src: [f32][8] @ AVX2):
-    assert stride(src, 0) == 1
-    assert stride(dst, 0) == 1
-
-    for i in seq(0, 8):
-        dst[i] = src[i]
-
-
-@instr("{out_data} = _mm256_mul_ps({x_data}, {y_data});")
-def vector_multiply(out: [f32][8] @ AVX2, x: [f32][8] @ AVX2, y: [f32][8] @ AVX2):
-    assert stride(out, 0) == 1
-    assert stride(x, 0) == 1
-    assert stride(y, 0) == 1
-
-    for i in seq(0, 8):
-        out[i] = x[i] * y[i]
-
-
-@instr("{out_data} = _mm256_broadcast_ss(2.0);")
-def vector_assign_two(out: [f32][8] @ AVX2):
-    assert stride(out, 0) == 1
-
-    for i in seq(0, 8):
-        out[i] = 2.0
-
-
+# Algorithm definition
 @proc
-def vec_double(N: size, inp: f32[N], out: f32[N]):
-    assert N % 8 == 0
-    for i in seq(0, N):
-        out[i] = 2.0 * inp[i]
+def rank_k_reduce_6x16(
+    K: size, A: f32[6, K] @ DRAM, B: f32[K, 16] @ DRAM, C: f32[6, 16] @ DRAM
+):
+    for i in seq(0, 6):
+        for j in seq(0, 16):
+            for k in seq(0, K):
+                C[i, j] += A[i, k] * B[k, j]
 
 
-def wrong_schedule(p):
-    """
-    Forgot to set the memory types to be AVX2 vectors, so replace instruction
-    does not work as intended.
-    """
-    p = rename(p, "vec_double_optimized")
-    p = divide_loop(p, "i", 8, ["io", "ii"], perfect=True)
+print("=============Original Matmul==============")
+print(rank_k_reduce_6x16)
 
-    # Create a vector of twos
-    p = bind_expr(p, "2.0", "two_vec")
-    two_alloc = p.find("two_vec: _")
-    two_assign = p.find("two_vec = _")
-    p = expand_dim(p, two_alloc, 8, "ii")
+# In this example, we want the computation to be "output stationary", which means,
+# we want to preallocate all the output registers at the start.
+avx = rename(rank_k_reduce_6x16, "rank_k_reduce_6x16_scheduled")
+avx = reorder_loops(avx, "j k")
+avx = reorder_loops(avx, "i k")
 
-    # Hoist the allocation and assignment of two vector
-    p = lift_alloc(p, two_alloc, 2)
-    p = fission(p, two_assign.after(), 2)
-    p = remove_loop(p, two_assign.parent().parent())
+# The staging of C will cause us to consume 12 out of the 16 vector registers
+avx = divide_loop(avx, "for j in _: _", 8, ["jo", "ji"], perfect=True)
+avx = stage_mem(avx, "for k in _:_", "C[0:6, 0:16]", "C_reg")
+avx = simplify(avx)
 
-    # Create vectors for the input and output values
-    innermost_loop = p.find_loop("ii #1")
-    p = stage_mem(p, innermost_loop, "out[8*io:8*io+8]", "out_vec")
-    p = stage_mem(p, innermost_loop, "inp[8*io:8*io+8]", "inp_vec")
-    p = simplify(p)
+# Reshape C_reg so we can map it into vector registers
+avx = divide_dim(avx, "C_reg:_", 1, 8)
+avx = repeat(divide_loop)(avx, "for i1 in _: _", 8, ["i2", "i3"], perfect=True)
+avx = simplify(avx)
 
-    # Replace with AVX instructinos
-    avx_instrs = [vector_assign_two, vector_multiply, vector_load, vector_store]
-    p = replace_all(p, avx_instrs)
+# Map C_reg operations to vector instructions
+avx = set_memory(avx, "C_reg:_", AVX2)
+avx = replace_all(avx, mm256_loadu_ps)
+avx = replace_all(avx, mm256_storeu_ps)
+avx = simplify(avx)
 
-    return p
+# Now, the rest of the compute needs to work with the constraint that the
+# we only have 4 more registers to work with here.
 
+# B is easy, it is just two vector loads
+avx = stage_mem(avx, "for i in _:_", "B[k, 0:16]", "B_reg")
+avx = simplify(avx)
+avx = divide_loop(avx, "for i0 in _: _ #1", 8, ["io", "ii"], perfect=True)
+avx = divide_dim(avx, "B_reg:_", 0, 8)
+avx = set_memory(avx, "B_reg:_", AVX2)
+avx = simplify(avx)
+avx = replace_all(avx, mm256_loadu_ps)
+avx = simplify(avx)
 
-w = wrong_schedule(vec_double)
-print(w)
+# The final part is staging A. We will be using up two more vector registers.
+avx = bind_expr(avx, "A[i, k]", "A_reg")
+avx = expand_dim(avx, "A_reg", 8, "ji")
+avx = lift_alloc(avx, "A_reg", n_lifts=2)
+avx = fission(avx, avx.find("A_reg[ji] = _").after(), n_lifts=2)
+avx = remove_loop(avx, "for jo in _: _")
+avx = set_memory(avx, "A_reg:_", AVX2)
+avx = replace_all(avx, mm256_broadcast_ss)
+
+# Replace the FMA instructions to AVX2 instructions
+avx = replace_all(avx, mm256_fmadd_ps)
+avx = simplify(avx)
+
+print("=============Optimized Matmul==============")
+print(avx)
