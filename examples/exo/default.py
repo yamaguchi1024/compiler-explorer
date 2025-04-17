@@ -13,11 +13,6 @@ from exo import proc
 from exo.platforms.x86 import *
 from exo.stdlib.scheduling import *
 
-# Hide output when running through exocc.
-if __name__ != "__main__" and hasattr(os, "devnull"):
-    sys.stdout = open(os.devnull, "w")
-
-
 # Algorithm definition
 @proc
 def rank_k_reduce_6x16(
