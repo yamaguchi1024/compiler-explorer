@@ -1,3 +1,14 @@
+"""
+This example is taken from the Exo's GitHub repository,
+with more detailed explanation and the build scripts available at:
+https://github.com/exo-lang/exo/tree/main/examples/quiz2
+
+This is a quiz aiming to help you understand Exo's schedules by debugging them.
+The schedules in this file are incorrect. Your goal is to understand the code and
+fix the bug to match the correct output!
+Correct output and the solution are available on GitHub.
+"""
+
 from __future__ import annotations
 
 from exo import *

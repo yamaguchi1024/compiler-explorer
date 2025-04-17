@@ -1,3 +1,9 @@
+"""
+This example is taken from the Exo's GitHub repository,
+with more detailed explanation and the build scripts available at:
+https://github.com/exo-lang/exo/tree/main/examples/avx2_matmul
+"""
+
 from __future__ import annotations
 
 import os

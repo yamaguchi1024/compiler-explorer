@@ -1,3 +1,12 @@
+"""
+This example is taken from the Exo's GitHub repository,
+with more detailed explanation and the build scripts available at:
+https://github.com/exo-lang/exo/tree/main/examples/rvm_conv1d
+
+The tutorial accompanying this example is at:
+https://exo-lang.dev/tutorial.html
+"""
+
 from __future__ import annotations
 
 import os
